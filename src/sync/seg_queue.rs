@@ -4,42 +4,92 @@ use std::{ptr, mem};
 use std::cmp;
 use std::cell::UnsafeCell;
 
-use mem::epoch::{self, Atomic, Owned};
+use mem::epoch::{self, Atomic, Owned, StaticDrop};
 
 const SEG_SIZE: usize = 32;
+
+// FIXME: add Drop impl to drop pending items
 
 /// A Michael-Scott queue that allocates "segments" (arrays of nodes)
 /// for efficiency.
 ///
 /// Usable with any number of producers and consumers.
 pub struct SegQueue<T> {
-    head: Atomic<Segment<T>>,
-    tail: Atomic<Segment<T>>,
+    head: AtomicSegment<T>,
+    tail: AtomicSegment<T>,
 }
+
+type AtomicSegment<T> = Atomic<Segment<T>, ()>;
 
 struct Segment<T> {
     low: AtomicUsize,
-    data: [UnsafeCell<(T, AtomicBool)>; SEG_SIZE],
+    items: [Item<T>; SEG_SIZE],
     high: AtomicUsize,
-    next: Atomic<Segment<T>>,
+    next: AtomicSegment<T>,
+}
+
+unsafe impl<T> StaticDrop for Segment<T> {}
+
+struct Item<T> {
+    // Uninitialized until `ready` is `true`
+    data: UnsafeCell<Option<T>>,
+    ready: AtomicBool,
+}
+
+impl<T> Item<T> {
+    // Insert data into an item. Can only be invoked once per item,
+    // and only when the `ready` flag is false.
+    fn put(&self, data: T) {
+        debug_assert!(!self.ready.load(Relaxed));
+
+        // the existing `data` contents are uninitialized
+        unsafe {
+            ptr::write(self.data.get(), Some(data));
+        }
+
+        // store `ready` flag in `Release` so that readers will see the data
+        self.ready.store(true, Release);
+    }
+
+    // Spin until data is ready, and then extract that data. Can only be invoked
+    // once per item.
+    fn take(&self) -> T {
+        loop {
+            if self.ready.load(Acquire) { break; }
+        }
+        unsafe {
+            (*self.data.get()).take().unwrap()
+
+        }
+    }
+}
+
+impl<T> Drop for Item<T> {
+    fn drop(&mut self) {
+        // If the item was never written, go ahead and initialize the data
+        // component so that the interio drop will work correctly.
+        if !self.ready.load(Relaxed) {
+            unsafe {
+                ptr::write(self.data.get(), None);
+            }
+        }
+    }
 }
 
 unsafe impl<T: Send> Sync for Segment<T> {}
 
 impl<T> Segment<T> {
     fn new() -> Segment<T> {
-        let rqueue = Segment {
-            data: unsafe { mem::uninitialized() },
+        let mut seg = Segment {
+            items: unsafe { mem::uninitialized() },
             low: AtomicUsize::new(0),
             high: AtomicUsize::new(0),
             next: Atomic::null(),
         };
-        for val in rqueue.data.iter() {
-            unsafe {
-                (*val.get()).1 = AtomicBool::new(false);
-            }
+        for item in &mut seg.items {
+            item.ready = AtomicBool::new(false);
         }
-        rqueue
+        seg
     }
 }
 
@@ -50,7 +100,7 @@ impl<T> SegQueue<T> {
             head: Atomic::null(),
             tail: Atomic::null(),
         };
-        let sentinel = Owned::new(Segment::new());
+        let sentinel = Owned::new(Segment::new(), ());
         let guard = epoch::pin();
         let sentinel = q.head.store_and_ref(sentinel, Relaxed, &guard);
         q.tail.store_shared(Some(sentinel), Relaxed);
@@ -64,19 +114,17 @@ impl<T> SegQueue<T> {
             let tail = self.tail.load(Acquire, &guard).unwrap();
             if tail.high.load(Relaxed) >= SEG_SIZE { continue }
             let i = tail.high.fetch_add(1, Relaxed);
-            unsafe {
-                if i < SEG_SIZE {
-                    let cell = (*tail).data.get_unchecked(i).get();
-                    ptr::write(&mut (*cell).0, t);
-                    (*cell).1.store(true, Release);
-
-                    if i + 1 == SEG_SIZE {
-                        let tail = tail.next.store_and_ref(Owned::new(Segment::new()), Release, &guard);
-                        self.tail.store_shared(Some(tail), Release);
-                    }
-
-                    return
+            if i < SEG_SIZE {
+                unsafe {
+                    (*tail).items.get_unchecked(i).put(t);
                 }
+                if i + 1 == SEG_SIZE {
+                    let tail_seg = Owned::new(Segment::new(), ());
+                    let tail = tail.next.store_and_ref(tail_seg, Release, &guard);
+                    self.tail.store_shared(Some(tail), Release);
+                }
+
+                return
             }
         }
     }
@@ -92,22 +140,19 @@ impl<T> SegQueue<T> {
                 let low = head.low.load(Relaxed);
                 if low >= cmp::min(head.high.load(Relaxed), SEG_SIZE) { break }
                 if head.low.compare_and_swap(low, low+1, Relaxed) == low {
-                    unsafe {
-                        let cell = (*head).data.get_unchecked(low).get();
+                    let data = unsafe {
+                        (*head).items.get_unchecked(low).take()
+                    };
+                    if low + 1 == SEG_SIZE {
                         loop {
-                            if (*cell).1.load(Acquire) { break }
-                        }
-                        if low + 1 == SEG_SIZE {
-                            loop {
-                                if let Some(next) = head.next.load(Acquire, &guard) {
-                                    self.head.store_shared(Some(next), Release);
-                                    guard.unlinked(head);
-                                    break
-                                }
+                            if let Some(next) = head.next.load(Acquire, &guard) {
+                                self.head.store_shared(Some(next), Release);
+                                unsafe { guard.unlinked(head); }
+                                break;
                             }
                         }
-                        return Some(ptr::read(&(*cell).0))
                     }
+                    return Some(data);
                 }
             }
             if head.next.load(Relaxed, &guard).is_none() { return None }

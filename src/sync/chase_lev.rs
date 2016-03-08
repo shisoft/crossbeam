@@ -38,6 +38,8 @@
 //! [chase_lev]: http://neteril.org/~jeremie/Dynamic_Circular_Work_Queue.pdf
 //! [weak_chase_lev]: http://www.di.ens.fr/~zappa/readings/ppopp13.pdf
 
+// FIXME: add Drop impl to drop pending items
+
 use std::cell::UnsafeCell;
 use std::mem;
 use std::ptr;
@@ -45,7 +47,7 @@ use std::sync::atomic::Ordering::{Acquire, Relaxed, Release, SeqCst};
 use std::sync::atomic::{AtomicIsize, fence};
 use std::sync::Arc;
 
-use mem::epoch::{self, Atomic, Shared, Owned};
+use mem::epoch::{self, Atomic, Shared, Owned, StaticDrop};
 
 // Once the queue is less than 1/K full, then it will be downsized. Note that
 // the deque requires that this number be less than 2.
@@ -61,7 +63,7 @@ const MIN_BITS: u32 = 7;
 struct Deque<T> {
     bottom: AtomicIsize,
     top: AtomicIsize,
-    array: Atomic<Buffer<T>>,
+    array: Atomic<Buffer<T>, ()>,
 }
 
 // FIXME: can these constraints be relaxed?
@@ -109,6 +111,8 @@ struct Buffer<T> {
     log_size: u32,
 }
 
+unsafe impl<T> StaticDrop for Buffer<T> {}
+
 impl<T> Worker<T> {
     /// Pushes data onto the front of this work queue.
     pub fn push(&mut self, t: T) {
@@ -148,7 +152,7 @@ pub fn deque<T>() -> (Worker<T>, Stealer<T>) {
 impl<T> Deque<T> {
     fn new() -> Deque<T> {
         let array = Atomic::null();
-        array.store(Some(Owned::new(Buffer::new(MIN_BITS))), SeqCst);
+        array.store(Some(Owned::new(Buffer::new(MIN_BITS), ())), SeqCst);
         Deque {
             bottom: AtomicIsize::new(0),
             top: AtomicIsize::new(0),
@@ -266,11 +270,11 @@ impl<T> Deque<T> {
     // This method may only be called safely from the workers due to the way it modifies
     // the array pointer.
     unsafe fn swap_buffer<'a>(&self,
-                              old: Shared<'a, Buffer<T>>,
+                              old: Shared<'a, Buffer<T>, ()>,
                               buf: Buffer<T>,
                               guard: &'a epoch::Guard)
-                              -> Shared<'a, Buffer<T>> {
-        let newbuf = Owned::new(buf);
+                              -> Shared<'a, Buffer<T>, ()> {
+        let newbuf = Owned::new(buf, ());
         let newbuf = self.array.store_and_ref(newbuf, Release, &guard);
         guard.unlinked(old);
 

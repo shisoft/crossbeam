@@ -1,19 +1,22 @@
 use std::sync::atomic::Ordering::{Acquire, Release, Relaxed};
-use std::ptr;
 
-use mem::epoch::{self, Atomic, Owned};
+use mem::epoch::{self, Atomic, Owned, StaticDrop};
+
+// FIXME: add Drop impl to drop pending items
 
 /// Treiber's lock-free stack.
 ///
 /// Usable with any number of producers and consumers.
 pub struct TreiberStack<T> {
-    head: Atomic<Node<T>>,
+    head: NodePtr<T>,
+}
+type NodePtr<T> = Atomic<SharedData<T>, T>;
+
+struct SharedData<T> {
+    next: NodePtr<T>,
 }
 
-struct Node<T> {
-    data: T,
-    next: Atomic<Node<T>>,
-}
+unsafe impl<T> StaticDrop for SharedData<T> {}
 
 impl<T> TreiberStack<T> {
     /// Create a new, empty stack.
@@ -25,14 +28,11 @@ impl<T> TreiberStack<T> {
 
     /// Push `t` on top of the stack.
     pub fn push(&self, t: T) {
-        let mut n = Owned::new(Node {
-            data: t,
-            next: Atomic::null()
-        });
+        let mut n = Owned::new(SharedData { next: Atomic::null() }, t);
         let guard = epoch::pin();
         loop {
             let head = self.head.load(Relaxed, &guard);
-            n.next.store_shared(head, Relaxed);
+            n.shared_mut().next.store_shared(head, Relaxed);
             match self.head.cas_and_ref(head, n, Release, &guard) {
                 Ok(_) => break,
                 Err(owned) => n = owned,
@@ -51,8 +51,7 @@ impl<T> TreiberStack<T> {
                     let next = head.next.load(Relaxed, &guard);
                     if self.head.cas_shared(Some(head), next, Release) {
                         unsafe {
-                            guard.unlinked(head);
-                            return Some(ptr::read(&(*head).data))
+                            return Some(guard.unlinked(head));
                         }
                     }
                 }
@@ -76,12 +75,11 @@ mod test {
     fn is_empty() {
         let q: TreiberStack<i64> = TreiberStack::new();
         assert!(q.is_empty());
-        q.push(20);
-        q.push(20);
+        q.push(1);
+        q.push(2);
         assert!(!q.is_empty());
-        assert!(!q.is_empty());
-        assert!(q.pop().is_some());
-        assert!(q.pop().is_some());
+        assert!(q.pop() == Some(1));
+        assert!(q.pop() == Some(2));
         assert!(q.is_empty());
         q.push(25);
         assert!(!q.is_empty());

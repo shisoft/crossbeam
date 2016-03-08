@@ -137,86 +137,123 @@ mod participants;
 pub use self::atomic::Atomic;
 pub use self::guard::{pin, Guard};
 
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 use std::ptr;
 use std::mem;
 
-/// Like `Box<T>`: an owned, heap-allocated data value of type `T`.
-pub struct Owned<T> {
-    data: Box<T>,
+pub unsafe trait StaticDrop {}
+
+// FIXME: want to do the following, but that rules out any other impls due to coherence
+// pub unsafe impl<T: 'static> StaticDrop for T {}
+
+/// Like `Box`, represents a fully-owned heap allocation, but with two pieces of
+/// data of type `S` and `E` respectively.
+///
+/// Ownership of the allocated data is intended to pass into a concurrent data
+/// structure by use of an atomic pointer like `Atomic`. After ownership is
+/// transferred, the two pieces of data play different roles:
+///
+/// - `S`: this data is *shared* freely between threads, and the atomic pointer
+/// retains ownership of it until the memory is reclaimed by crossbeam, at which
+/// point the destructor is run.
+///
+/// - `E`: this data is held in *escrow* by crossbeam, and will be transferred
+/// back when `unlinked` is called.
+pub struct Owned<S, E> {
+    data: Box<Managed<S, E>>,
 }
 
-impl<T> Owned<T> {
-    /// Move `t` to a new heap allocation.
-    pub fn new(t: T) -> Owned<T> {
-        Owned { data: Box::new(t) }
-    }
-
-    fn as_raw(&self) -> *mut T {
-        self.deref() as *const _ as *mut _
-    }
-
-    /// Move data out of the owned box, deallocating the box.
-    pub fn into_inner(self) -> T {
-        *self.data
-    }
+struct Managed<S, E> {
+    shared: S,
+    escrow: E,
 }
 
-impl<T> Deref for Owned<T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        &self.data
-    }
-}
-
-impl<T> DerefMut for Owned<T> {
-    fn deref_mut(&mut self) -> &mut T {
-        &mut self.data
-    }
-}
-
-#[derive(PartialEq, Eq)]
-/// Like `&'a T`: a shared reference valid for lifetime `'a`.
-pub struct Shared<'a, T: 'a> {
-    data: &'a T,
-}
-
-impl<'a, T> Copy for Shared<'a, T> {}
-impl<'a, T> Clone for Shared<'a, T> {
-    fn clone(&self) -> Shared<'a, T> {
-        Shared { data: self.data }
-    }
-}
-
-impl<'a, T> Deref for Shared<'a, T> {
-    type Target = &'a T;
-    fn deref(&self) -> &&'a T {
-        &self.data
-    }
-}
-
-impl<'a, T> Shared<'a, T> {
-    unsafe fn from_raw(raw: *mut T) -> Option<Shared<'a, T>> {
-        if raw == ptr::null_mut() { None }
-        else {
-            Some(Shared {
-                data: mem::transmute::<*mut T, &T>(raw)
+impl<S, E> Owned<S, E> {
+    /// Move the given data to a new heap allocation.
+    pub fn new(shared: S, escrow: E) -> Owned<S, E> {
+        Owned {
+            data: Box::new(Managed {
+                shared: shared,
+                escrow: escrow
             })
         }
     }
 
-    unsafe fn from_ref(r: &T) -> Shared<'a, T> {
-        Shared { data: mem::transmute(r) }
+    fn as_raw(&self) -> *mut Managed<S, E> {
+        self.deref() as *const _ as *mut _
     }
 
-    unsafe fn from_owned(owned: Owned<T>) -> Shared<'a, T> {
-        let ret = Shared::from_ref(owned.deref());
-        mem::forget(owned);
-        ret
+    /// Move data out of the owned box, deallocating the box.
+    pub fn into_inner(self) -> (S, E) {
+        let managed = *self.data;
+        (managed.shared, managed.escrow)
     }
 
-    pub fn as_raw(&self) -> *mut T {
-        self.data as *const _ as *mut _
+    pub fn shared(&self) -> &S {
+        &self.data.shared
+    }
+
+    pub fn shared_mut(&mut self) -> &mut S {
+        &mut self.data.shared
+    }
+
+    pub fn escrow(&self) -> &E {
+        &self.data.escrow
+    }
+
+    pub fn escrow_mut(&mut self) -> &mut E {
+        &mut self.data.escrow
+    }
+}
+
+/// Like `&'a S`: a shared reference valid for lifetime `'a`.
+pub struct Shared<'a, S: 'a, E: 'a> {
+    managed: &'a Managed<S, E>,
+    shared: &'a S, // FIXME: get rid of this hack
+}
+
+impl<'a, S, E> Copy for Shared<'a, S, E> {}
+impl<'a, S, E> Clone for Shared<'a, S, E> {
+    fn clone(&self) -> Shared<'a, S, E> {
+        *self
+    }
+}
+
+impl<'a, S, E> Deref for Shared<'a, S, E> {
+    type Target = &'a S;
+    fn deref(&self) -> &&'a S {
+        &&self.shared
+    }
+}
+
+impl<'a, S, E> Shared<'a, S, E> {
+    unsafe fn from_raw(raw: *mut Managed<S, E>) -> Option<Shared<'a, S, E>> {
+        if raw == ptr::null_mut() { None }
+        else {
+            let managed: &'a Managed<S, E> = mem::transmute(raw);
+
+            Some(Shared {
+                managed: managed,
+                shared: &managed.shared
+            })
+        }
+    }
+
+    unsafe fn from_owned(owned: Owned<S, E>) -> Shared<'a, S, E> {
+        let managed: *mut Managed<S, E> = Box::into_raw(owned.data);
+        let managed: &'a Managed<S, E> = mem::transmute(managed);
+        Shared {
+            managed: managed,
+            shared: &managed.shared
+        }
+    }
+
+    fn as_raw(&self) -> *mut Managed<S, E> {
+        self.managed as *const _ as *mut _
+    }
+
+    pub fn eq_ptr(&self, other: Shared<S, E>) -> bool {
+        self.as_raw() == other.as_raw()
     }
 }
 
@@ -225,12 +262,12 @@ impl<'a, T> Shared<'a, T> {
 mod test {
     use std::sync::atomic::Ordering;
     use super::*;
-    use mem::epoch;
 
     #[test]
     fn test_no_drop() {
         static mut DROPS: i32 = 0;
         struct Test;
+        unsafe impl StaticDrop for Test {}
         impl Drop for Test {
             fn drop(&mut self) {
                 unsafe {
@@ -241,23 +278,15 @@ mod test {
         let g = pin();
 
         let x = Atomic::null();
-        x.store(Some(Owned::new(Test)), Ordering::Relaxed);
-        x.store_and_ref(Owned::new(Test), Ordering::Relaxed, &g);
+        x.store(Some(Owned::new(Test, ())), Ordering::Relaxed);
+        x.store_and_ref(Owned::new(Test, ()), Ordering::Relaxed, &g);
         let y = x.load(Ordering::Relaxed, &g);
-        let z = x.cas_and_ref(y, Owned::new(Test), Ordering::Relaxed, &g).ok();
-        let _ = x.cas(z, Some(Owned::new(Test)), Ordering::Relaxed);
-        x.swap(Some(Owned::new(Test)), Ordering::Relaxed, &g);
+        let z = x.cas_and_ref(y, Owned::new(Test, ()), Ordering::Relaxed, &g).ok();
+        let _ = x.cas(z, Some(Owned::new(Test, ())), Ordering::Relaxed);
+        x.swap(Some(Owned::new(Test, ())), Ordering::Relaxed, &g);
 
         unsafe {
             assert_eq!(DROPS, 0);
         }
-    }
-
-    #[test]
-    fn test_new() {
-        let guard = epoch::pin();
-        let my_atomic = Atomic::new(42);
-
-        assert_eq!(**my_atomic.load(Ordering::Relaxed, &guard).unwrap(), 42);
     }
 }

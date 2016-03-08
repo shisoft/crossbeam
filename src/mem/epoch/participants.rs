@@ -6,14 +6,16 @@ use std::mem;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::Ordering::{Relaxed, Acquire, Release};
 
-use mem::epoch::{Atomic, Owned, Guard};
+use mem::epoch::{Atomic, Owned, Guard, StaticDrop};
 use mem::epoch::participant::Participant;
 use mem::CachePadded;
 
 /// Global, threadsafe list of threads participating in epoch management.
 pub struct Participants {
-    head: Atomic<ParticipantNode>
+    head: Atomic<ParticipantNode, ()>
 }
+
+unsafe impl StaticDrop for ParticipantNode {}
 
 pub struct ParticipantNode(CachePadded<Participant>);
 
@@ -50,7 +52,7 @@ impl Participants {
     /// Enroll a new thread in epoch management by adding a new `Particpant`
     /// record to the global list.
     pub fn enroll(&self) -> *const Participant {
-        let mut participant = Owned::new(ParticipantNode::new());
+        let mut participant = Owned::new(ParticipantNode::new(), ());
 
         // we ultimately use epoch tracking to free Participant nodes, but we
         // can't actually enter an epoch here, so fake it; we know the node
@@ -59,7 +61,7 @@ impl Participants {
         let g: &'static Guard = unsafe { mem::transmute(&fake_guard) };
         loop {
             let head = self.head.load(Relaxed, g);
-            participant.next.store_shared(head, Relaxed);
+            participant.shared_mut().next.store_shared(head, Relaxed);
             match self.head.cas_and_ref(head, participant, Release, g) {
                 Ok(shared) => {
                     let shared: &Participant = &shared;
@@ -84,7 +86,7 @@ impl Participants {
 pub struct Iter<'a> {
     // pin to an epoch so that we can free inactive nodes
     guard: &'a Guard,
-    next: &'a Atomic<ParticipantNode>,
+    next: &'a Atomic<ParticipantNode, ()>,
 
     // an Acquire read is needed only for the first read, due to release
     // sequences

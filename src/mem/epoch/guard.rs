@@ -1,4 +1,5 @@
 use std::marker;
+use std::ptr;
 
 use super::{local, Shared};
 
@@ -38,8 +39,9 @@ pub fn pin() -> Guard {
 impl Guard {
     /// Assert that the value is no longer reachable from a lock-free data
     /// structure and should be collected when sufficient epochs have passed.
-    pub unsafe fn unlinked<T>(&self, val: Shared<T>) {
-        local::with_participant(|p| p.reclaim(val.as_raw()))
+    pub unsafe fn unlinked<S, T>(&self, val: Shared<S, T>) -> T {
+        local::with_participant(|p| p.reclaim(val.as_raw()));
+        ptr::read(&val.managed.escrow)
     }
 
     /// Move the thread-local garbage into the global set of garbage.

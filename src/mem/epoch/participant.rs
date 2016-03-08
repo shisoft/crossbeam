@@ -26,7 +26,7 @@ pub struct Participant {
     pub active: AtomicBool,
 
     /// The participant list is coded intrusively; here's the `next` pointer.
-    pub next: Atomic<ParticipantNode>,
+    pub next: Atomic<ParticipantNode, ()>,
 }
 
 unsafe impl Sync for Participant {}
