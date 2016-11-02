@@ -306,6 +306,23 @@ impl<T> MsQueue<T> {
             }
         }
     }
+
+    //SHFT: peek function with clone, no ownership taken
+    pub fn peek_clone(&self) -> Option<T> where T: Clone {
+        let guard = epoch::pin();
+        let head = self.head.load(Acquire, &guard).unwrap();
+        if let Some(next) = head.next.load(Acquire, &guard) {
+            if let Payload::Data(ref t) = next.payload {
+                unsafe {
+                    Some(ptr::read(t).clone())
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -507,5 +524,21 @@ mod test {
         assert!(!q.is_empty());
         assert!(!q.is_empty());
         assert!(q.try_pop().is_some());
+    }
+
+    //SHFT: tests for peek_clone;
+    #[test]
+    fn peek_clone() {
+        let q: MsQueue<i64> = MsQueue::new();
+        q.push(10);
+        q.push(20);
+        q.push(30);
+        assert!(!q.is_empty());
+        assert_eq!(q.peek_clone().unwrap(), 10);
+        assert_eq!(q.pop(), 10);
+        assert_eq!(q.peek_clone().unwrap(), 20);
+        assert_eq!(q.pop(), 20);
+        assert_eq!(q.pop(), 30);
+        assert!(q.peek_clone().is_none());
     }
 }
